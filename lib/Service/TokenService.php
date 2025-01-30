@@ -13,13 +13,16 @@ use GuzzleHttp\Exception\ServerException;
 use OCA\UserOIDC\AppInfo\Application;
 use OCA\UserOIDC\Db\ProviderMapper;
 use OCA\UserOIDC\Exception\TokenExchangeFailedException;
+use OCA\UserOIDC\Exception\TokenValidationFailedException;
 use OCA\UserOIDC\Model\Token;
 use OCA\UserOIDC\Vendor\Firebase\JWT\JWT;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Db\MultipleObjectsReturnedException;
+use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\Http\Client\IClient;
 use OCP\Http\Client\IClientService;
 use OCP\IConfig;
+use OCP\IL10N;
 use OCP\IRequest;
 use OCP\ISession;
 use OCP\IURLGenerator;
@@ -27,6 +30,7 @@ use OCP\IUserSession;
 use OCP\PreConditionNotMetException;
 use OCP\Security\ICrypto;
 use Psr\Log\LoggerInterface;
+use UnexpectedValueException;
 
 /**
  * Token management service
@@ -50,6 +54,10 @@ class TokenService {
 		private IURLGenerator $urlGenerator,
 		private DiscoveryService $discoveryService,
 		private ProviderMapper $providerMapper,
+		private IL10N $l10n,
+		private ITimeFactory $timeFactory,
+		private ProvisioningService $provisioningService,
+		private ProviderService $providerService,
 	) {
 		$this->client = $clientService->newClient();
 	}
@@ -102,12 +110,6 @@ class TokenService {
 	 * @throws PreConditionNotMetException
 	 */
 	public function checkLoginToken(): void {
-		$oidcSystemConfig = $this->config->getSystemValue('user_oidc', []);
-		$tokenExchangeEnabled = (isset($oidcSystemConfig['token_exchange']) && $oidcSystemConfig['token_exchange'] === true);
-		if (!$tokenExchangeEnabled) {
-			return;
-		}
-
 		$currentUser = $this->userSession->getUser();
 		if (!$this->userSession->isLoggedIn() || $currentUser === null) {
 			$this->logger->debug('[TokenService] checkLoginToken: user not logged in');
@@ -133,6 +135,79 @@ class TokenService {
 		}
 	}
 
+	/**
+	 * @throws MultipleObjectsReturnedException
+	 * @throws TokenValidationFailedException
+	 * @throws DoesNotExistException
+	 * @throws \JsonException
+	 */
+	public function validateToken(int $providerId, string $idTokenRaw, string $nonce = ''): \stdClass {
+		// TODO: proper error handling
+		$oidcSystemConfig = $this->config->getSystemValue('user_oidc', []);
+		$provider = $this->providerMapper->getProvider($providerId);
+		$discovery = $this->discoveryService->obtainDiscovery($provider);
+		$jwks = $this->discoveryService->obtainJWK($provider, $idTokenRaw);
+		JWT::$leeway = 60;
+		try {
+			$idTokenPayload = JWT::decode($idTokenRaw, $jwks);
+		} catch (UnexpectedValueException $e) {
+			$this->logger->debug('Failed to decode the JWT token, retrying with fresh JWK');
+			$jwks = $this->discoveryService->obtainJWK($provider, $idTokenRaw, false);
+			$idTokenPayload = JWT::decode($idTokenRaw, $jwks);
+		}
+
+		$this->logger->debug('Parsed the JWT payload: ' . json_encode($idTokenPayload, JSON_THROW_ON_ERROR));
+
+		if ($idTokenPayload->exp < $this->timeFactory->getTime()) {
+			$this->logger->debug('Token expired');
+			$message = $this->l10n->t('The received token is expired.');
+			throw new TokenValidationFailedException($message, ['reason' => 'token expired']);
+		}
+
+		// Verify issuer
+		if ($idTokenPayload->iss !== $discovery['issuer']) {
+			$this->logger->debug('This token is issued by the wrong issuer');
+			$message = $this->l10n->t('The issuer does not match the one from the discovery endpoint');
+			throw new TokenValidationFailedException($message, ['invalid_issuer' => $idTokenPayload->iss]);
+		}
+
+		// Verify audience
+		$checkAudience = !isset($oidcSystemConfig['login_validation_audience_check'])
+			|| !in_array($oidcSystemConfig['login_validation_audience_check'], [false, 'false', 0, '0'], true);
+		if ($checkAudience) {
+			$tokenAudience = $idTokenPayload->aud;
+			$providerClientId = $provider->getClientId();
+			if (
+				(is_string($tokenAudience) && $tokenAudience !== $providerClientId)
+				|| (is_array($tokenAudience) && !in_array($providerClientId, $tokenAudience, true))
+			) {
+				$this->logger->debug('This token is not for us');
+				$message = $this->l10n->t('The audience does not match ours');
+				throw new TokenValidationFailedException($message, ['invalid_audience' => $idTokenPayload->aud]);
+			}
+		}
+
+		$checkAzp = !isset($oidcSystemConfig['login_validation_azp_check'])
+			|| !in_array($oidcSystemConfig['login_validation_azp_check'], [false, 'false', 0, '0'], true);
+		if ($checkAzp) {
+			// ref https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+			// If the azp claim is present, it should be the client ID
+			if (isset($idTokenPayload->azp) && $idTokenPayload->azp !== $provider->getClientId()) {
+				$this->logger->debug('This token is not for us, authorized party (azp) is different than the client ID');
+				$message = $this->l10n->t('The authorized party does not match ours');
+				throw new TokenValidationFailedException($message, ['invalid_azp' => $idTokenPayload->azp]);
+			}
+		}
+
+		if (isset($idTokenPayload->nonce) && $idTokenPayload->nonce !== $nonce) {
+			$this->logger->debug('Nonce does not match');
+			$message = $this->l10n->t('The nonce does not match');
+			throw new TokenValidationFailedException($message, ['reason' => 'invalid nonce']);
+		}
+
+		return $idTokenPayload;
+	}
+
 	public function reauthenticate(int $providerId) {
 		// Logout the user and redirect to the oidc login flow to gather a fresh token
 		$this->userSession->logout();
@@ -155,7 +230,6 @@ class TokenService {
 	public function refresh(Token $token): Token {
 		$oidcProvider = $this->providerMapper->getProvider($token->getProviderId());
 		$discovery = $this->discoveryService->obtainDiscovery($oidcProvider);
-
 		try {
 			$clientSecret = $oidcProvider->getClientSecret();
 			if ($clientSecret !== '') {
@@ -185,7 +259,17 @@ class TokenService {
 			]);
 			$body = $result->getBody();
 			$bodyArray = json_decode(trim($body), true, 512, JSON_THROW_ON_ERROR);
+			$idTokenPayload = $this->validateToken($token->getProviderId(), $bodyArray['id_token']);
 			$this->logger->debug('[TokenService] ---- Refresh token success');
+
+			// re-provision user if changed
+			$uidAttribute = $this->providerService->getSetting($token->getProviderId(), ProviderService::SETTING_MAPPING_UID, 'sub');
+			$userId = $idTokenPayload->{$uidAttribute} ?? null;
+			if ($userId === null) {
+				$this->logger->error('[TokenService] Failed to refresh token, no user ID found in the token');
+				return $token;
+			}
+			$this->provisioningService->provisionUser($userId, $token->getProviderId(), $idTokenPayload);
 			return $this->storeToken(
 				array_merge(
 					$bodyArray,
@@ -197,14 +281,6 @@ class TokenService {
 			// Failed to refresh, return old token which will be retried or otherwise timeout if expired
 			return $token;
 		}
-	}
-
-	public function decodeIdToken(Token $token): array {
-		$provider = $this->providerMapper->getProvider($token->getProviderId());
-		$jwks = $this->discoveryService->obtainJWK($provider, $token->getIdToken());
-		JWT::$leeway = 60;
-		$idTokenObject = JWT::decode($token->getIdToken(), $jwks);
-		return json_decode(json_encode($idTokenObject), true);
 	}
 
 	/**

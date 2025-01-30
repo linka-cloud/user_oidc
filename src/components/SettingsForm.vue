@@ -249,6 +249,16 @@
 		<p class="settings-hint">
 			{{ t('user_oidc', 'Only groups matching the whitelist regex will be created, updated and deleted by the group claim. For example: {regex} allows all groups which ID starts with {substr}', { regex: '/^blue/', substr: 'blue' }) }}
 		</p>
+		<p>
+			<label for="group-whitelist-regex">{{ t('user_oidc', 'Admin Group') }}</label>
+			<input id="admin-group"
+				v-model="localProvider.settings.adminGroup"
+				type="text">
+		</p>
+		<p class="settings-hint">
+			{{ t('user_oidc', 'Users from this group will be added to the admin group') }}
+		</p>
+
 		<NcCheckboxRadioSwitch :checked.sync="localProvider.settings.restrictLoginToGroups" wrapper-element="div">
 			{{ t('user_oidc', 'Restrict login for users that are not in any whitelisted group') }}
 		</NcCheckboxRadioSwitch>

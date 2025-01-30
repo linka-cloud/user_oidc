@@ -48,6 +48,7 @@ class ProviderService {
 	public const SETTING_PROVIDER_BASED_ID = 'providerBasedId';
 	public const SETTING_GROUP_PROVISIONING = 'groupProvisioning';
 	public const SETTING_GROUP_WHITELIST_REGEX = 'groupWhitelistRegex';
+	public const SETTING_ADMIN_GROUP = 'adminGroup';
 	public const SETTING_RESTRICT_LOGIN_TO_GROUPS = 'restrictLoginToGroups';
 
 	public const BOOLEAN_SETTINGS_DEFAULT_VALUES = [
@@ -164,6 +165,7 @@ class ProviderService {
 			self::SETTING_PROVIDER_BASED_ID,
 			self::SETTING_GROUP_PROVISIONING,
 			self::SETTING_GROUP_WHITELIST_REGEX,
+			self::SETTING_ADMIN_GROUP,
 			self::SETTING_RESTRICT_LOGIN_TO_GROUPS,
 		];
 	}

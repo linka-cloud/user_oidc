@@ -431,6 +431,8 @@ class ProvisioningService {
 		$this->eventDispatcher->dispatchTyped($event);
 		$this->logger->debug('Group mapping event dispatched');
 
+		$adminGroup = $this->providerService->getSetting($providerId, ProviderService::SETTING_ADMIN_GROUP);
+
 		if ($event->hasValue() && $event->getValue() !== null) {
 			// casted to null if empty value
 			$groups = json_decode($event->getValue() ?? '');
@@ -443,9 +445,16 @@ class ProvisioningService {
 				$groups = array_filter($groups);
 			}
 			$syncGroups = [];
-
+			$isAdmin = false;
 			foreach ($groups as $k => $v) {
 				if (is_object($v)) {
+					// TODO(adphi): Handle array of objects, e.g. [{value: "1", display: "group1"}, ...]
+					// see https://www.iana.org/assignments/jwt/jwt.xhtml
+					// and https://www.rfc-editor.org/rfc/rfc7643.html#section-4.1.2
+					if (!empty($v->value) && !empty($v->display)) {
+						$v = (object)['gid' => $v->value, 'displayName' => $v->display];
+					}
+
 					// Handle array of objects, e.g. [{gid: "1", displayName: "group1"}, ...]
 					if (empty($v->gid) && $v->gid !== '0' && $v->gid !== 0) {
 						continue;
@@ -463,9 +472,18 @@ class ProvisioningService {
 					continue;
 				}
 
+				if ($adminGroup !== "" && $group->gid === $adminGroup) {
+					$isAdmin = true;
+				}
+
 				$group->gid = $this->idService->getId($providerId, $group->gid);
 
+
 				$syncGroups[] = $group;
+			}
+
+			if ($isAdmin) {
+				$syncGroups[] = (object)['gid' => "admin"];
 			}
 
 			return $syncGroups;

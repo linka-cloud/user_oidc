@@ -20,6 +20,7 @@ use OCA\UserOIDC\AppInfo\Application;
 use OCA\UserOIDC\Db\ProviderMapper;
 use OCA\UserOIDC\Db\SessionMapper;
 use OCA\UserOIDC\Event\TokenObtainedEvent;
+use OCA\UserOIDC\Exception\TokenValidationFailedException;
 use OCA\UserOIDC\Service\DiscoveryService;
 use OCA\UserOIDC\Service\LdapService;
 use OCA\UserOIDC\Service\ProviderService;
@@ -395,65 +396,11 @@ class LoginController extends BaseOidcController {
 		$this->logger->debug('Received code response: ' . json_encode($data, JSON_THROW_ON_ERROR));
 		$this->eventDispatcher->dispatchTyped(new TokenObtainedEvent($data, $provider, $discovery));
 
-		// TODO: proper error handling
 		$idTokenRaw = $data['id_token'];
-		$jwks = $this->discoveryService->obtainJWK($provider, $idTokenRaw);
-		JWT::$leeway = 60;
 		try {
-			$idTokenPayload = JWT::decode($idTokenRaw, $jwks);
-		} catch (UnexpectedValueException $e) {
-			$this->logger->debug('Failed to decode the JWT token, retrying with fresh JWK');
-			$jwks = $this->discoveryService->obtainJWK($provider, $idTokenRaw, false);
-			$idTokenPayload = JWT::decode($idTokenRaw, $jwks);
-		}
-
-		$this->logger->debug('Parsed the JWT payload: ' . json_encode($idTokenPayload, JSON_THROW_ON_ERROR));
-
-		if ($idTokenPayload->exp < $this->timeFactory->getTime()) {
-			$this->logger->debug('Token expired');
-			$message = $this->l10n->t('The received token is expired.');
-			return $this->build403TemplateResponse($message, Http::STATUS_FORBIDDEN, ['reason' => 'token expired']);
-		}
-
-		// Verify issuer
-		if ($idTokenPayload->iss !== $discovery['issuer']) {
-			$this->logger->debug('This token is issued by the wrong issuer');
-			$message = $this->l10n->t('The issuer does not match the one from the discovery endpoint');
-			return $this->build403TemplateResponse($message, Http::STATUS_FORBIDDEN, ['invalid_issuer' => $idTokenPayload->iss]);
-		}
-
-		// Verify audience
-		$checkAudience = !isset($oidcSystemConfig['login_validation_audience_check'])
-			|| !in_array($oidcSystemConfig['login_validation_audience_check'], [false, 'false', 0, '0'], true);
-		if ($checkAudience) {
-			$tokenAudience = $idTokenPayload->aud;
-			$providerClientId = $provider->getClientId();
-			if (
-				(is_string($tokenAudience) && $tokenAudience !== $providerClientId)
-				|| (is_array($tokenAudience) && !in_array($providerClientId, $tokenAudience, true))
-			) {
-				$this->logger->debug('This token is not for us');
-				$message = $this->l10n->t('The audience does not match ours');
-				return $this->build403TemplateResponse($message, Http::STATUS_FORBIDDEN, ['invalid_audience' => $idTokenPayload->aud]);
-			}
-		}
-
-		$checkAzp = !isset($oidcSystemConfig['login_validation_azp_check'])
-			|| !in_array($oidcSystemConfig['login_validation_azp_check'], [false, 'false', 0, '0'], true);
-		if ($checkAzp) {
-			// ref https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-			// If the azp claim is present, it should be the client ID
-			if (isset($idTokenPayload->azp) && $idTokenPayload->azp !== $provider->getClientId()) {
-				$this->logger->debug('This token is not for us, authorized party (azp) is different than the client ID');
-				$message = $this->l10n->t('The authorized party does not match ours');
-				return $this->build403TemplateResponse($message, Http::STATUS_FORBIDDEN, ['invalid_azp' => $idTokenPayload->azp]);
-			}
-		}
-
-		if (isset($idTokenPayload->nonce) && $idTokenPayload->nonce !== $this->session->get(self::NONCE)) {
-			$this->logger->debug('Nonce does not match');
-			$message = $this->l10n->t('The nonce does not match');
-			return $this->build403TemplateResponse($message, Http::STATUS_FORBIDDEN, ['reason' => 'invalid nonce']);
+			$idTokenPayload = $this->tokenService->validateToken($providerId, $idTokenRaw, $this->session->get(self::NONCE));
+		} catch (TokenValidationFailedException $e) {
+			return $this->build403TemplateResponse($e->getMessage(), Http::STATUS_FORBIDDEN, $e->getData());
 		}
 
 		// get user ID attribute
@@ -525,15 +472,12 @@ class LoginController extends BaseOidcController {
 			$this->eventDispatcher->dispatchTyped(new UserLoggedInEvent($user, $user->getUID(), null, false));
 		}
 
-		$tokenExchangeEnabled = (isset($oidcSystemConfig['token_exchange']) && $oidcSystemConfig['token_exchange'] === true);
-		if ($tokenExchangeEnabled) {
-			// store all token information for potential token exchange requests
-			$tokenData = array_merge(
-				$data,
-				['provider_id' => $providerId],
-			);
-			$this->tokenService->storeToken($tokenData);
-		}
+		// store all token information to check for token expiration and maybe refresh
+		$tokenData = array_merge(
+			$data,
+			['provider_id' => $providerId],
+		);
+		$this->tokenService->storeToken($tokenData);
 		$this->config->setUserValue($user->getUID(), Application::APP_ID, 'had_token_once', '1');
 
 		// Set last password confirm to the future as we don't have passwords to confirm against with SSO
